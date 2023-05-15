@@ -7,6 +7,7 @@ use env_logger;
 use httparse;
 use lazy_static::lazy_static;
 use log::{debug, error, info};
+use rand::Rng;
 use serde;
 use serde_json;
 use tokio::{
@@ -18,66 +19,77 @@ use tokio::{
     time::timeout,
 };
 
-#[tokio::main]
+const OVERFLOWSIZE: usize = 1024 * 1024 * 50;
+lazy_static! {}
+
+#[tokio::main(worker_threads = 8)]
 async fn main() {
     env_logger::init();
-    let listener = net::TcpListener::bind("0.0.0.0:8000").await.unwrap();
-    loop {
-        let (mut stream, addr) = listener.accept().await.unwrap();
-        tokio::spawn(async move {
-            let (mut r, mut w) = stream.into_split();
 
-            let raw_proxy_header = read_proxy_header(&r).await;
-            let (method, path) = extra_method_path(&raw_proxy_header);
+    let mut tasks = Vec::new();
+    for i in 0..100 {
+        let task = tokio::spawn(async move {
+            let port = 8000 + i;
+            let listener = net::TcpListener::bind(format!("0.0.0.0:{port}"))
+                .await
+                .unwrap();
+            loop {
+                let (mut stream, addr) = listener.accept().await.unwrap();
+                tokio::spawn(async move {
+                    let (mut r, mut w) = stream.into_split();
 
-            let mut target = match method.to_uppercase().as_str() {
-                "CONNECT" => net::TcpStream::connect(path),
-                _ => {
-                    let mut tmp = path.split('/').nth(2).unwrap();
-                    let _path = match &tmp.contains(':') {
-                        true => tmp.to_string(),
-                        false => {
-                            let x = format!("{}:80", tmp);
-                            x
+                    let raw_proxy_header = read_proxy_header(&r).await;
+                    let (method, path) = extra_method_path(&raw_proxy_header);
+
+                    let mut target = match method.to_uppercase().as_str() {
+                        "CONNECT" => net::TcpStream::connect(path),
+                        _ => {
+                            let mut tmp = path.split('/').nth(2).unwrap();
+                            let _path = match &tmp.contains(':') {
+                                true => tmp.to_string(),
+                                false => {
+                                    let x = format!("{}:80", tmp);
+                                    x
+                                }
+                            };
+                            net::TcpStream::connect(_path)
                         }
                     };
-                    net::TcpStream::connect(_path)
-                }
-            };
 
-            // timeout !
-            let mut target = timeout(Duration::from_secs(2), target)
-                .await
-                .unwrap()
-                .unwrap();
+                    // timeout !
+                    let mut target = timeout(Duration::from_secs(2), target)
+                        .await
+                        .unwrap()
+                        .unwrap();
 
-            let (mut tr, mut tw) = target.into_split();
+                    let (mut tr, mut tw) = target.into_split();
 
-            if method.to_uppercase() == "CONNECT" {
-                &w.writable().await.unwrap();
-                &w.try_write("HTTP/1.1 200 Connection Established\r\n\r\n".as_bytes())
-                    .unwrap();
+                    if method.to_uppercase() == "CONNECT" {
+                        &w.writable().await.unwrap();
+                        &w.try_write("HTTP/1.1 200 Connection Established\r\n\r\n".as_bytes())
+                            .unwrap();
+                    }
+
+                    //
+                    tokio::spawn(async move {
+                        //tr, w
+                        r2w(&tr, &w, "读目标").await;
+                    });
+                    tokio::spawn(async move {
+                        //r, tw
+                        if method.to_uppercase() != "CONNECT" {
+                            &tw.try_write(&raw_proxy_header);
+                        }
+                        r2w(&r, &tw, "写目标").await;
+                    });
+                });
             }
-
-            //
-            tokio::spawn(async move {
-                //tr, w
-                r2w(&tr, &w, "读目标").await;
-            });
-            tokio::spawn(async move {
-                //r, tw
-                if method.to_uppercase() != "CONNECT" {
-                    &tw.try_write(&raw_proxy_header);
-                }
-                r2w(&r, &tw, "写目标").await;
-            });
-
-            //let mut buff = Vec::with_capacity(50);
-            //let size = r.read(&mut buff).unwrap();
-
-            //&w.writable().await.unwrap();
-            //&w.try_write("".as_bytes()).unwrap();
         });
+        tasks.push(task);
+    }
+
+    for task in tasks {
+        task.await.unwrap();
     }
 }
 
@@ -117,12 +129,12 @@ async fn read_proxy_header(r: &OwnedReadHalf) -> Vec<u8> {
             Ok(n) => n,
             Err(_) => break,
         };
-        if n == 0 || buff.len() > 1024 * 1024 * 50 {
+        if n == 0 || buff.len() > OVERFLOWSIZE {
             break;
         }
         buffer.extend_from_slice(&buff[..n]);
     }
-    debug!("{}", std::str::from_utf8(&buffer).unwrap());
+    debug!("{} bytes {:?}", &buffer.len(), &buffer);
     buffer
 }
 
@@ -158,7 +170,7 @@ mod tests {
                     Ok(n) => n,
                     Err(_) => break,
                 };
-                if n == 0 || buff.len() > 1024 * 1024 * 50 {
+                if n == 0 || buff.len() > OVERFLOWSIZE {
                     break;
                 }
                 buffer.extend_from_slice(&buff[..n]);
@@ -168,5 +180,15 @@ mod tests {
         })
         .await
         .unwrap();
+    }
+
+    #[test]
+    fn rt_test() {
+        let mut rt = tokio::runtime::Runtime::new().unwrap();
+        for i in 0..100 {
+            rt.spawn(async move {
+                println!("hello from {}", i);
+            });
+        }
     }
 }
