@@ -17,7 +17,7 @@ use rustls::{
 };
 use rustls_pemfile::{certs, rsa_private_keys};
 use tokio::{
-    io::{split, AsyncReadExt, AsyncWriteExt},
+    io::{self, split, AsyncReadExt, AsyncWriteExt},
     net::{
         tcp::{OwnedReadHalf, OwnedWriteHalf, ReadHalf, WriteHalf},
         TcpListener, TcpStream,
@@ -243,31 +243,31 @@ async fn main() {
 
                 let (mut r, mut w) = split(tls_stream);
 
-                let mut target_header_buf = Vec::new();
-                loop {
-                    // wtf vec就不行, 也不报错
-                    let mut buff = [0; 1024];
-                    let n = match r.read(&mut buff).await {
-                        Ok(n) => n,
-                        Err(_) => break,
-                    };
-                    println!("{}", n);
-                    target_header_buf.extend_from_slice(&buff[..n]);
-                    if n == 0 || buff.len() > OVERFLOWSIZE || n < 1024 {
-                        break;
-                    }
-                }
-                dbg!(&target_header_buf);
+                //let mut target_header_buf = Vec::new();
+                //loop {
+                //    // wtf vec就不行, 也不报错
+                //    let mut buff = [0; 1024];
+                //    let n = match r.read(&mut buff).await {
+                //        Ok(n) => n,
+                //        Err(_) => break,
+                //    };
+                //    println!("{}", n);
+                //    target_header_buf.extend_from_slice(&buff[..n]);
+                //    if n == 0 || buff.len() > OVERFLOWSIZE || n < 1024 {
+                //        break;
+                //    }
+                //}
+                //dbg!(&target_header_buf);
 
-                //let mut target_header_buf = [0u8; 1024];
-                //let n = &r.read(&mut target_header_buf).await.unwrap();
+                ////let mut target_header_buf = [0u8; 1024];
+                ////let n = &r.read(&mut target_header_buf).await.unwrap();
 
-                //let target_header_buf = &target_header_buf[..n].into();
+                ////let target_header_buf = &target_header_buf[..n].into();
 
-                println!(
-                    "https 协议 header & body\r\n-------------------------------\r\n{}",
-                    std::str::from_utf8(target_header_buf.as_slice()).unwrap()
-                );
+                //println!(
+                //    "https 协议 header & body\r\n-------------------------------\r\n{}",
+                //    std::str::from_utf8(target_header_buf.as_slice()).unwrap()
+                //);
 
                 let mut root_cert_store = RootCertStore::empty();
                 root_cert_store.add_server_trust_anchors(
@@ -295,51 +295,38 @@ async fn main() {
                 }
                 dbg!(&host);
 
-                let raw_suites = "4865-4866-4867";
+                let raw_suites = "4865-4866-49196";
+
+                let raw_suites =
+                    "4865-4866-4867-49195-49199-49196-49200-52393-52392-49181-49172-156-157-47-53";
                 let mut suites = Vec::new();
                 for i in raw_suites.split('-') {
                     suites.push(CipherSuite::from(i.parse::<u16>().unwrap()));
                 }
-                //client_config.custom_cipher_suites = Some(suites);
-                let mut conn = rustls::ClientConnection::new(
-                    Arc::new(client_config),
-                    host.as_str().try_into().unwrap(),
-                )
-                .unwrap();
+                client_config.custom_cipher_suites = Some(suites);
 
-                let mut target_stream = std::net::TcpStream::connect(target).unwrap();
-                let mut tls_target_stream = rustls::Stream::new(&mut conn, &mut target_stream);
-
-                // todo!
-                // use tokio copy later
-
-                tls_target_stream
-                    .write_all(target_header_buf.as_slice())
+                let conn = tokio_rustls::TlsConnector::from(Arc::new(client_config));
+                let mut target_stream = tokio::net::TcpStream::connect(target).await.unwrap();
+                let target_stream = conn
+                    .connect(host.as_str().try_into().unwrap(), target_stream)
+                    .await
                     .unwrap();
-                //let mut resp = [0; 1024];
-                //tls_target_stream.read(&mut resp).unwrap();
-                let mut resp = Vec::new();
+                let (mut tr, mut tw) = split(target_stream);
 
-                loop {
-                    // wtf vec就不行, 也不报错
-                    let mut buff = [0; 1024];
-                    let n = match tls_target_stream.read(&mut buff) {
-                        Ok(n) => n,
-                        Err(_) => break,
-                    };
-                    println!("{}", n);
-                    resp.extend_from_slice(&buff[..n]);
-                    if n == 0 || buff.len() > OVERFLOWSIZE || n < 1024 {
-                        break;
-                    }
-                }
+                //let host = rustls::ServerName::try_from(host.as_str()).unwrap();
+                //let mut conn =
+                //    rustls::ClientConnection::new(Arc::new(client_config), host).unwrap();
+                //let mut target_stream = std::net::TcpStream::connect(target).unwrap();
+                //let mut tls_stream = rustls::Stream::new(&mut conn, &mut target_stream);
+                //let (mut tr, mut tw) = split(tokio_stream);
 
-                println!(
-                    "https 协议 resp\r\n-------------------------------\r\n{}",
-                    std::str::from_utf8(resp.as_slice()).unwrap()
-                );
-                w.write_all(resp.as_slice()).await.unwrap();
-                w.flush().await.unwrap();
+                tokio::spawn(async move {
+                    let buf = io::copy(&mut r, &mut tw).await.unwrap();
+                    dbg!(buf);
+                });
+                tokio::spawn(async move {
+                    io::copy(&mut tr, &mut w).await.unwrap();
+                });
             }
         });
     }
