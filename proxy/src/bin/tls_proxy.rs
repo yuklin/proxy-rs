@@ -4,6 +4,7 @@ use std::{
     fs::File,
     io::{stdout, BufReader, Read, Write},
     sync::Arc,
+    time::Duration,
     vec,
 };
 
@@ -42,6 +43,10 @@ struct Opt {
     /// port
     #[argh(option, short = 'p')]
     port: Option<u16>,
+
+    /// fingerprints
+    #[argh(option, short = 'f')]
+    fp: Option<String>,
 }
 
 fn load_cert(filepath: String) -> Vec<rustls::Certificate> {
@@ -87,18 +92,6 @@ async fn read_proxy_header<'a>(r: &ReadHalf<'a>) -> BString {
     }
     debug!("{} bytes {:?}", &buffer.len(), &buffer);
     BString::from(buffer)
-}
-
-fn splite_bs(buff: &Vec<u8>) -> Vec<Vec<u8>> {
-    let mut res = Vec::new();
-    let mut start = 0;
-    //for i in 0..buff.len() {
-    //    if buff[i] == b'\n' {
-    //        res.push(buff[start..i].to_vec());
-    //        start = i + 1;
-    //    }
-    //}
-    res
 }
 
 fn parse_proxy_header(header_buff: &BString) -> ProxyProtocol {
@@ -202,12 +195,22 @@ async fn main() {
         .with_single_cert(cert, key.remove(0))
         .unwrap();
 
+    let fp = opt.fp.unwrap_or_else(|| String::from("")).clone();
+
+    let Some((raw_suites, exts)) = fp.split_once(",") else {
+        panic!("fp format error")
+    };
+    let raw_suites = raw_suites.to_string();
+    let exts = exts.to_string();
+
     let acceptor = TlsAcceptor::from(Arc::new(server_config));
     let listener = TcpListener::bind(format!("0.0.0.0:{port}")).await.unwrap();
     loop {
         let (mut stream, addr) = listener.accept().await.unwrap();
         let raw_stream = stream.into_std().unwrap();
         let acceptor = acceptor.clone();
+        let raw_suites = raw_suites.clone();
+        let exts = exts.clone();
         tokio::spawn(async move {
             let mock_stream = raw_stream.try_clone().unwrap();
             let mut proxy_stream = TcpStream::from_std(raw_stream).unwrap();
@@ -295,30 +298,28 @@ async fn main() {
                 }
                 dbg!(&host);
 
-                let raw_suites = "4865-4866-49196";
-
-                let raw_suites =
-                    "4865-4866-4867-49195-49199-49196-49200-52393-52392-49181-49172-156-157-47-53";
                 let mut suites = Vec::new();
                 for i in raw_suites.split('-') {
                     suites.push(CipherSuite::from(i.parse::<u16>().unwrap()));
                 }
                 client_config.custom_cipher_suites = Some(suites);
+                client_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+
+                client_config.custom_extensions = Some(exts.to_string());
 
                 let conn = tokio_rustls::TlsConnector::from(Arc::new(client_config));
-                let mut target_stream = tokio::net::TcpStream::connect(target).await.unwrap();
+                let mut target_stream = tokio::net::TcpStream::connect(target);
+                let target_stream = timeout(Duration::from_secs(3), target_stream)
+                    .await
+                    .unwrap()
+                    .unwrap();
+
                 let target_stream = conn
                     .connect(host.as_str().try_into().unwrap(), target_stream)
                     .await
                     .unwrap();
-                let (mut tr, mut tw) = split(target_stream);
 
-                //let host = rustls::ServerName::try_from(host.as_str()).unwrap();
-                //let mut conn =
-                //    rustls::ClientConnection::new(Arc::new(client_config), host).unwrap();
-                //let mut target_stream = std::net::TcpStream::connect(target).unwrap();
-                //let mut tls_stream = rustls::Stream::new(&mut conn, &mut target_stream);
-                //let (mut tr, mut tw) = split(tokio_stream);
+                let (mut tr, mut tw) = split(target_stream);
 
                 tokio::spawn(async move {
                     let buf = io::copy(&mut r, &mut tw).await.unwrap();

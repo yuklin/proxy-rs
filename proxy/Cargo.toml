@@ -4,6 +4,8 @@ version = "0.1.0"
 edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[profile.release]
+strip = true
 
 [dependencies]
 argh = "0.1.10"
@@ -12,6 +14,7 @@ env_logger = "0.10.0"
 httparse = "1.8.0"
 lazy_static = "1.4.0"
 log = "0.4.17"
+md5 = "0.7.0"
 rand = "0.8.5"
 rustls = { version = "0.21.1", path = "../../rustls/rustls" }
 rustls-pemfile = "1.0.2"
