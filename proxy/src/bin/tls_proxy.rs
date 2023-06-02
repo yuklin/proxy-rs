@@ -224,8 +224,8 @@ async fn main() {
     let opt: Opt = argh::from_env();
 
     let port = opt.port.unwrap_or_else(|| 8000);
-    let cert = load_cert(opt.cert.unwrap_or_else(|| "cert.pem".to_string()));
-    let mut key = load_key(opt.key.unwrap_or_else(|| "cert.key".to_string()));
+    let cert = load_cert(opt.cert.unwrap_or_else(|| "server.crt".to_string()));
+    let mut key = load_key(opt.key.unwrap_or_else(|| "server.key".to_string()));
     let server_config = ServerConfig::builder()
         .with_safe_defaults()
         .with_no_client_auth()
@@ -277,13 +277,78 @@ async fn main() {
 
             let mut proxy_protocol_header = read_proxy_header(&rr).await;
             let proxy_protocol = parse_proxy_header(&proxy_protocol_header);
+            println!(
+                "代理协议\r\n-------------------------------\r\n{}",
+                std::str::from_utf8(&proxy_protocol_header.as_slice()).unwrap()
+            );
 
-            if proxy_protocol.https {
-                println!(
-                    "代理协议\r\n-------------------------------\r\n{}",
-                    std::str::from_utf8(&proxy_protocol_header.as_slice()).unwrap()
-                );
+            if !proxy_protocol.https {
+                let target = proxy_protocol.target;
+                dbg!(&target);
+                let mut host = String::new();
+                let mut port = 80;
 
+                match target.find(':') {
+                    None => host = target.clone(),
+                    Some(n) => {
+                        host = target[..n].to_string();
+                        port = target[n + 1..].parse::<u16>().unwrap();
+                    }
+                }
+
+                let target_stream = tokio::net::TcpStream::connect(&redir);
+
+                let mut target_tcp_stream = timeout(Duration::from_secs(3), target_stream)
+                    .await
+                    .unwrap()
+                    .unwrap();
+
+                let mut ss_header: Vec<u8> = Vec::new();
+                ss_header.push(0x03);
+                ss_header.push(host.len() as u8);
+                ss_header.append(host.clone().into_bytes().as_mut());
+                ss_header.append(port.to_be_bytes().to_vec().as_mut());
+
+                let ss_header = ss_cipher.encrypt(&mut ss_header);
+
+                let de_cipher = ss_cipher.clone();
+
+                target_tcp_stream.write(ss_header.as_slice()).await.unwrap();
+                target_tcp_stream
+                    .write(
+                        ss_cipher
+                            .encrypt(&proxy_protocol_header.as_slice())
+                            .as_slice(),
+                    )
+                    .await
+                    .unwrap();
+
+                let (mut hook_stream_in, mut hook_stream_out) =
+                    tokio::net::UnixStream::pair().unwrap();
+                let (mut target_tcp_read, mut target_tcp_write) = target_tcp_stream.into_split();
+                let (mut hook_read, mut hook_write) = hook_stream_out.into_split();
+
+                tokio::spawn(async move {
+                    loop {
+                        let mut buff: Vec<u8> = Vec::with_capacity(1024);
+                        target_tcp_read.readable().await.unwrap();
+                        let n = target_tcp_read.read_buf(&mut buff).await.unwrap();
+                        if n == 0 {
+                            break;
+                        }
+                        let buff = de_cipher.decrypt(&mut buff);
+                        debug!(
+                            "target read {} bytes\r\n-------------------------------\r\n{}",
+                            &n,
+                            std::str::from_utf8(&buff.as_slice()).unwrap()
+                        );
+                        hook_write.writable().await.unwrap();
+                        hook_write.write(buff.as_slice()).await.unwrap();
+                    }
+                });
+
+                io::copy_bidirectional(&mut hook_stream_in, &mut proxy_stream).await;
+            } else if proxy_protocol.https {
                 &rw.writable().await.unwrap();
                 &rw.try_write("HTTP/1.1 200 Connection Established\r\n\r\n".as_bytes())
                     .unwrap();
