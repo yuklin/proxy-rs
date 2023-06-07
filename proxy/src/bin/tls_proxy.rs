@@ -17,7 +17,7 @@ use rustls::{
     server::{Acceptor, ServerConfig},
     Certificate, CipherSuite, OwnedTrustAnchor, PrivateKey, RootCertStore,
 };
-use rustls_pemfile::{certs, rsa_private_keys};
+use rustls_pemfile::{certs, ec_private_keys, rsa_private_keys};
 use tokio::{
     io::{self, split, AsyncReadExt, AsyncWriteExt},
     net::{
@@ -31,6 +31,40 @@ use tokio_rustls::{TlsAcceptor, TlsStream};
 use proxy::cipher::Table;
 
 const OVERFLOWSIZE: usize = 1024 * 1024 * 50;
+
+struct NoCertificateVerification {}
+
+// client not cert verity
+impl rustls::client::ServerCertVerifier for NoCertificateVerification {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &rustls::Certificate,
+        _intermediates: &[rustls::Certificate],
+        _server_name: &rustls::ServerName,
+        _scts: &mut dyn Iterator<Item = &[u8]>,
+        _ocsp: &[u8],
+        _now: std::time::SystemTime,
+    ) -> Result<rustls::client::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::ServerCertVerified::assertion())
+    }
+}
+
+//impl rustls::server::ClientCertVerifier for NoCertificateVerification {
+//    fn client_auth_root_subjects(
+//        &self,
+//        _sni: Option<&rustls::ServerName>,
+//    ) -> Option<rustls::DistinguishedNames> {
+//        None
+//    }
+//
+//    fn verify_client_cert(
+//        &self,
+//        _presented_certs: &[rustls::Certificate],
+//        _sni: Option<&rustls::ServerName>,
+//    ) -> Result<rustls::server::ClientCertVerified, rustls::TLSError> {
+//        Ok(rustls::server::ClientCertVerified::assertion())
+//    }
+//}
 
 #[derive(FromArgs, Debug)]
 /// arg parser
@@ -70,7 +104,7 @@ fn load_cert(filepath: String) -> Vec<rustls::Certificate> {
 }
 
 fn load_key(filepath: String) -> Vec<rustls::PrivateKey> {
-    rsa_private_keys(&mut BufReader::new(
+    ec_private_keys(&mut BufReader::new(
         std::fs::File::open(&filepath).unwrap_or_else(|_| panic!("cannot open {}", filepath)),
     ))
     .map_err(|_| panic!("invalid key {}", filepath))
@@ -226,11 +260,25 @@ async fn main() {
     let port = opt.port.unwrap_or_else(|| 8000);
     let cert = load_cert(opt.cert.unwrap_or_else(|| "server.crt".to_string()));
     let mut key = load_key(opt.key.unwrap_or_else(|| "server.key".to_string()));
-    let server_config = ServerConfig::builder()
-        .with_safe_defaults()
+    //let mut server_config = ServerConfig::builder()
+    //    .with_safe_defaults()
+    //    .with_no_client_auth()
+    //    .with_single_cert(cert, key.remove(0))
+    //    .unwrap();
+
+    let mut server_config = ServerConfig::builder()
+        .with_cipher_suites(&rustls::ALL_CIPHER_SUITES.to_vec())
+        .with_safe_default_kx_groups()
+        .with_safe_default_protocol_versions()
+        .unwrap()
         .with_no_client_auth()
         .with_single_cert(cert, key.remove(0))
         .unwrap();
+
+    server_config.ignore_client_order = true;
+
+    dbg!(rustls::ALL_CIPHER_SUITES);
+    //let mut dangerous_server_config = rustls::ServerConfig::dangerous();
 
     let fp = opt.fp.unwrap_or_else(|| String::from("")).clone();
 
@@ -376,6 +424,9 @@ async fn main() {
                     .with_root_certificates(root_cert_store)
                     .with_no_client_auth();
 
+                let mut dangerous_config = rustls::ClientConfig::dangerous(&mut client_config);
+                dangerous_config.set_certificate_verifier(Arc::new(NoCertificateVerification {}));
+
                 let target = proxy_protocol.target;
                 dbg!(&target);
                 let mut host = String::new();
@@ -465,10 +516,10 @@ async fn main() {
                 let (mut tr, mut tw) = split(target_stream);
 
                 tokio::spawn(async move {
-                    let buf = io::copy(&mut r, &mut tw).await.unwrap();
+                    io::copy(&mut r, &mut tw).await;
                 });
                 tokio::spawn(async move {
-                    io::copy(&mut tr, &mut w).await.unwrap();
+                    io::copy(&mut tr, &mut w).await;
                 });
             }
         });
